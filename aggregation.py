@@ -1,206 +1,168 @@
 import torch
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
+# from qpth.qp import QPFunction, SpQPFunction
+# from enum import Enum
 
 
-def var_opt_aggr(plosses):
-    if (plosses > 0.0).sum() == 0.0:
-        weights = torch.where(plosses > 0.0, plosses * 0.0 + 1.0, plosses * 0.0)
-        weights[weights == 0.0] = 1 / weights.shape[0]
-        return weights
+def var_opt_aggr_batch(plosses):
+    ad_plosses = torch.where(plosses.sum(dim=1, keepdim=True) > 0.0, plosses, plosses + 1.0)
 
-    nz_plosses = plosses[plosses>0.]
-    if torch.isinf(nz_plosses).sum() > 0.0:
-        print("nz_plosses contains nan")
-        print(nz_plosses)
+    nume_weights = ad_plosses ** 2
+    nume_weights[torch.isinf(nume_weights)] = 0.0
+    nume_weights[torch.isnan(nume_weights)] = 0.0
+    nume_weights[nume_weights.sum(dim=1) == 0.0] = 1.0
 
-    if torch.isnan(nz_plosses).sum() > 0.0:
-        print("nz_plosses contains inf")
-        print(nz_plosses)
-
-    nume_weights = nz_plosses ** 2
-
-    if torch.isinf(nume_weights).sum() > 0.0:
-        print("nume_weights contains nan")
-        print(nume_weights)
-
-    if torch.isnan(nume_weights).sum() > 0.0:
-        print("nume_weights contains inf")
-        print(nume_weights)
-
-    deno_weight = nume_weights.sum()
-    nz_weights = nume_weights / deno_weight
-
-    weights = torch.where(plosses > 0.0, plosses * 0.0 + 1.0, plosses * 0.0)
-    weights[weights > 0.0] = nz_weights
+    deno_weight = nume_weights.sum(dim=1, keepdim=True)
+    weights = nume_weights / deno_weight
 
     return weights
 
-def data_size_aggr(plosses):
-    if (plosses > 0.0).sum() == 0.0:
-        weights = torch.where(plosses > 0.0, plosses * 0.0 + 1.0, plosses * 0.0)
-        weights[weights == 0.0] = 1 / weights.shape[0]
+def data_size_aggr_batch(plosses, sizes):
+    ad_plosses = torch.where(plosses.sum(dim=1, keepdim=True) > 0.0, plosses, plosses + 1.0)
 
-        return weights
-
-    weights = torch.where(plosses > 0.0, plosses * 0.0 + 1.0, plosses * 0.0)
-    weights[weights > 0.0] = 1 / (weights > 0.0).sum().item()
+    weights = torch.where(ad_plosses > 0.0, ad_plosses * 0.0 + sizes, ad_plosses * 0.0)
+    weights = weights / weights.sum(dim=1, keepdim=True)
 
     return weights
 
+def diffcp_aggr_batch(plosses_batch, sizes_batch, L=1.0):
 
-def error_opt_aggr(plosses, L=1.0):
-    if (plosses > 0.0).sum() == 0.0:
-        weights = torch.where(plosses > 0.0, plosses * 0.0 + 1.0, plosses * 0.0)
-        weights[weights == 0.0] = 1 / weights.shape[0]
-        # print("all-zero weights")
-        return weights
+    n_batch = plosses_batch.shape[0]
+    ad_plosses_batch = torch.where(plosses_batch.sum(dim=1, keepdim=True) > 0.0, plosses_batch, plosses_batch + 1.0)
+    weights_batch = torch.where(ad_plosses_batch > 0.0, ad_plosses_batch * 0.0 + 1.0, ad_plosses_batch * 0.0)
 
+
+    for i in range(n_batch):
+        sub_plosses = ad_plosses_batch[i][ad_plosses_batch[i] > 0.0]
+        sub_sizes = sizes_batch[i][ad_plosses_batch[i] > 0.0]
+        weights_batch[i][weights_batch[i] > 0.0] = diffcp_aggr(sub_plosses, sub_sizes, L=L)
+
+    return weights_batch
+
+def diffcp_aggr(plosses, sizes, L=1.0):
     sensi = 2 * L
     device = plosses.device
 
-    vars = torch.where(plosses > 0.0, plosses * 0.0 + 1.0, plosses * 0.0)
-    vars[vars > 0.0] = (2 * (sensi / plosses[plosses>0.0]) ** 2)
-    weights = torch.where(vars > 0.0, vars * 0.0 + 1.0, vars * 0.0)
-
-    vars = vars[vars > 0.0]
-    vars = vars.cpu()
+    vars = (2 * (sensi / plosses) ** 2)
     n_agents = vars.shape[0]
 
-    x = cp.Variable(2 * n_agents)
-
-    Q1 = torch.diag(vars).cpu()
+    Q1 = torch.diag_embed(vars.detach()).cpu()
     Q2 = torch.zeros(n_agents, n_agents).cpu()
     Q3 = torch.zeros(n_agents, n_agents).cpu()
     Q4 = (torch.ones(n_agents, n_agents) * (L ** 2)).cpu()
-    Q12 = torch.cat((Q1, Q2), 1).cpu()
-    Q34 = torch.cat((Q3, Q4), 1).cpu()
-    Q = (torch.cat((Q12, Q34), 0)).view(2 * n_agents, 2 * n_agents)
-    # Q.requires_grad = True
+    Q12 = torch.cat((Q1, Q2), 1)
+    Q34 = torch.cat((Q3, Q4), 1)
+    Q = (torch.cat((Q12, Q34), 0)).reshape(2 * n_agents, 2 * n_agents)
 
-    Q_sqrt_cvxpy = cp.Parameter((2 * n_agents, 2 * n_agents))
+    A1 = torch.ones(n_agents)
+    A2 = torch.zeros(n_agents)
+    A = torch.cat((A1, A2), 0).reshape(-1).cpu()
 
-    A1 = torch.ones(n_agents).cpu()
-    A2 = torch.zeros(n_agents).cpu()
-    A = torch.cat((A1, A2), 0).view(1, 2 * n_agents)
-
-    b = torch.ones(1)
-
-    G1 = torch.eye(n_agents).cpu()
-    G2 = -torch.eye(n_agents).cpu()
-    G3 = -torch.eye(n_agents).cpu()
-    G4 = -torch.eye(n_agents).cpu()
+    G1 = torch.eye(n_agents)
+    G2 = -torch.eye(n_agents)
+    G3 = -torch.eye(n_agents)
+    G4 = -torch.eye(n_agents)
     G12 = torch.cat((G1, G2), 1)
     G34 = torch.cat((G3, G4), 1)
-    G = torch.cat((G12, G34), 0).view(2 * n_agents, 2 * n_agents)
+    G = torch.cat((G12, G34), 0).cpu()
 
-    h1 = (torch.ones(n_agents) * (1 / n_agents)).cpu()
-    h2 = (torch.ones(n_agents) * (-1 / n_agents)).cpu()
-    h = torch.cat((h1, h2), 0)
+    w = sizes / sizes.sum()
+    h1 = w
+    h2 = -w
+    h = torch.cat((h1, h2), 0).reshape(-1).cpu()
 
-    constrains = [A @ x == b, G @ x <= h]
-    objective = cp.Minimize(cp.sum_squares(Q_sqrt_cvxpy @ x))
+    h_cvxpy = cp.Parameter((2 * n_agents))
+    x_cvxpy = cp.Variable((2 * n_agents))
+
+
+    constrains = [A @ x_cvxpy == 1, G @ x_cvxpy <= h_cvxpy]
+    objective = cp.Minimize(0.5 * cp.quad_form(x_cvxpy, Q))
     problem = cp.Problem(objective, constrains)
 
-    cvxpylayer = CvxpyLayer(problem, parameters=[Q_sqrt_cvxpy], variables=[x])
+    try:
+        cvxpylayer = CvxpyLayer(problem, parameters=[h_cvxpy], variables=[x_cvxpy])
+    except ValueError:
+        print("ValueError: Problem must be DPP.")
+        return var_opt_aggr_batch(plosses.view(1, -1))
 
     try:
-        solution, = cvxpylayer(Q ** 0.5)
-        pos_weights = solution[: n_agents].to(device)
-        weights[weights > 0.0] = pos_weights
+        solution, = cvxpylayer(h)
+        weights = solution[:n_agents].to(device)
     except:
         print("SolverError")
         print(vars)
         if L == 0.00001:
             print("turn to VarOpt")
-            return var_opt_aggr(plosses)
-        weights = error_opt_aggr(plosses, L=L*0.1)
+            return var_opt_aggr_batch(plosses.view(1, -1))
+        weights = diffcp_aggr(plosses, sizes, L=L * 0.1)
 
-    return weights
+    return weights.reshape(1, -1)
 
-def aggr_batch(plosses_batch, method="OptAggr"):
-    n_batch = plosses_batch.shape[0]
-    n_agents = plosses_batch.shape[1]
-    weights_ls = []
+def error_bound_by_plosses_weights_batch(plosses_batch, sizes_batch, weights_batch, L=1.0, train=True):
 
-    if method == "VarOpt":
-        for i in range(n_batch):
-            weights_ls.append(var_opt_aggr(plosses_batch[i]).view(1, n_agents))
-    elif method == "OptAggr":
-        for i in range(n_batch):
-            weights_ls.append(error_opt_aggr(plosses_batch[i]).view(1, n_agents))
-    elif method == "ConvlAggr":
-        for i in range(n_batch):
-            weights_ls.append(data_size_aggr(plosses_batch[i]).view(1, n_agents))
-    else:
-        raise ValueError(f"{method} aggregation is not defined")
-
-    weights_batch = torch.cat(weights_ls)
-
-    return weights_batch
-
-
-def error_bound_by_plosses_batch(plosses_batch, sensi, L, method="VarOpt", eval_mode=False):
-    batch_size = plosses_batch.shape[0]
-    n_agents = plosses_batch.shape[1]
-    device = plosses_batch.device
-
-    ls = []
-    for batch in range(batch_size):
-        plosses = plosses_batch[batch, :].view(n_agents)
-        error_bound = error_bound_by_plosses(plosses, sensi, L, method, eval_mode=eval_mode)
-        ls.append(error_bound)
-    error_batch = torch.cat(ls, dim=0)
-
-    return error_batch.view(batch_size, 1)
-
-
-def error_bound_by_plosses(plosses, sensi, L, method='VarOpt', eval_mode=False):
-    device = plosses.device
-    n_agents = plosses.shape[0]
-    nz_plosses = plosses[plosses > 0.]
-
-    if eval_mode and nz_plosses.shape[0] == 0:
-        return torch.tensor(float("inf"), device=device, dtype=plosses.dtype).view(1)
-
-    if method == 'VarOpt':
-        weights = var_opt_aggr(plosses)
-    elif method == "OptAggr":
-            weights = error_opt_aggr(plosses)
-    elif method == 'ConvlAggr':
-        weights = data_size_aggr(plosses)
-
-    else:
-        raise ValueError(f"{method} aggregation is not defined")
-
-    if torch.isinf(weights).sum() > 0.0:
+    if torch.isinf(weights_batch).sum() > 0.0:
         print("weights contains inf")
-        print(weights)
+        print(weights_batch)
 
-    if torch.isnan(weights).sum() > 0.0:
+    if torch.isnan(weights_batch).sum() > 0.0:
         print("weights contains nan")
-        print(weights)
+        print(weights_batch)
 
+    sensi = 2 * L
 
-    var = ((weights[plosses > 0.0] * sensi / plosses[plosses > 0.])**2 * 2).sum()
+    if train:
+        var_batch = ((weights_batch * sensi / plosses_batch) ** 2 * 2)
+        var_batch[torch.isnan(var_batch)] = 0.0
+        var_batch[torch.isinf(var_batch)] = 0.0
+        var_batch = var_batch.sum(dim=1, keepdim=True)
+        var_batch[torch.isnan(var_batch)] = 0.0
+        var_batch[torch.isinf(var_batch)] = 0.0
+        if torch.isinf(var_batch).sum() > 0.0:
+            print("var contains inf")
+            print(var_batch)
 
+        if torch.isnan(var_batch).sum() > 0.0:
+            print("var contains nan")
+            print(var_batch)
+    else:
+        var_batch = ((weights_batch * sensi / plosses_batch) ** 2 * 2)
+        var_batch[torch.isnan(var_batch)] = 0.0
+        var_batch[torch.isinf(var_batch)] = 0.0
+        var_batch = var_batch.sum(dim=1, keepdim=True)
+        var_batch = torch.where(var_batch > 0.0, var_batch, 1 / var_batch)
+        # var_batch = torch.where(var_batch > 0.0, var_batch, var_batch + (sensi / 0.01) ** 2 * 2)
+    # print("Var")
+    # print(var_batch)
 
+    w_batch = sizes_batch / sizes_batch.sum(dim=1, keepdim=True)
+    quad_bias_batch = torch.abs(weights_batch - w_batch).sum(dim=1, keepdim=True) * L
+    # print("Bias")
+    # print(quad_bias_batch ** 2)
 
-    if torch.isinf(var).sum() > 0.0:
-        print("var contains inf")
-        print(var)
+    error_batch = quad_bias_batch ** 2 + var_batch
 
-    if torch.isnan(var).sum() > 0.0:
-        print("var contains nan")
-        print(var)
+    # print("Error")
+    # print(error_batch)
+    return error_batch
 
-    quad_bias = (torch.abs(weights - 1/n_agents)).sum() * L
+def error_bound_by_plosses_batch(plosses_batch, sizes_batch, L=1.0, method="OptAggr", train=True):
 
-    error_bound = quad_bias ** 2 + var
-    return error_bound.view(1)
+    if method == "OptAggr":
+        weights_batch = diffcp_aggr_batch(plosses_batch, sizes_batch)
+    elif method == 'VarOpt':
+        weights_batch = var_opt_aggr_batch(plosses_batch)
+    elif method == 'ConvlAggr':
+        weights_batch = data_size_aggr_batch(plosses_batch, sizes_batch)
+    else:
+        raise ValueError(f"{method} aggregation is not defined")
 
+    # print(weights_batch)
+    error_batch = error_bound_by_plosses_weights_batch(plosses_batch, sizes_batch, weights_batch, L=L, train=train)
 
-def error_bound_by_allocs_batch(allocs_batch, pbudgets_batch, sensi, L, method='VarOpt'):
+    return error_batch
+
+def error_bound_by_allocs_batch(allocs_batch, pbudgets_batch, sizes_batch, L, method='OptAggr', train=True):
     n_agents = allocs_batch.shape[1]
     n_items = allocs_batch.shape[2]
     device = allocs_batch.device
@@ -209,8 +171,28 @@ def error_bound_by_allocs_batch(allocs_batch, pbudgets_batch, sensi, L, method='
     items = pbudgets_batch.view(-1, n_agents, 1).repeat(1, 1, n_items)
     items = items / deno
 
-    privacy_losses = torch.sum(allocs_batch * items, dim=2)
-    error_batch = error_bound_by_plosses_batch(privacy_losses, sensi, L, method=method)
+    privacy_losses_batch = torch.sum(allocs_batch * items, dim=2)
+    error_batch = error_bound_by_plosses_batch(privacy_losses_batch, sizes_batch, L, method=method, train=train)
 
     return error_batch
+
+def aggr_batch(plosses_batch, sizes_batch, method="OptAggr"):
+    n_batch = plosses_batch.shape[0]
+    n_agents = plosses_batch.shape[1]
+
+    if method == "VarOpt":
+        weights_batch = var_opt_aggr_batch(plosses_batch)
+    elif method == "OptAggr":
+        weights_batch = diffcp_aggr_batch(plosses_batch, sizes_batch)
+    elif method == "ConvlAggr":
+        weights_batch = data_size_aggr_batch(plosses_batch, sizes_batch)
+    else:
+        raise ValueError(f"{method} aggregation is not defined")
+
+    return weights_batch
+
+
+
+
+
 

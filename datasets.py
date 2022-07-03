@@ -1,3 +1,5 @@
+import time
+import pandas as pd
 import torch
 import random
 import math
@@ -9,39 +11,46 @@ import json
 class H5Dataset(Dataset):
     def __init__(self, data_tensor, target_tensor):
         assert data_tensor.shape[0] == target_tensor.shape[0]
-        self.data_tensor = data_tensor
-        self.target_tensor = target_tensor
+        self.data = data_tensor
+        self.targets = target_tensor
 
     def __getitem__(self, index):
-        return self.data_tensor[index], self.target_tensor[index]
+        return self.data[index], self.targets[index]
 
     def __len__(self):
-        return self.data_tensor.shape[0]
+        return self.data.shape[0]
 
+def load_data(filename):
+    f = open(filename, "rb")
+    data = np.loadtxt(f, delimiter=",", skiprows=1)
+    x = data[:, :-1]
+    x = torch.tensor(x)
+    y = data[:, -1]
+    y = torch.tensor(y)
+    data_set = H5Dataset(x, y)
+    f.close()
+    return data_set
 
 def load_bank():
-    data = np.loadtxt(open("data/bank-additional-full.csv", "rb"), delimiter=",", skiprows=1)
-    np.random.shuffle(data)
-    train_x = np.concatenate([data[0:30000, 0:14], data[0:30000, 15:]],axis=1)
-    train_x = torch.tensor(train_x)
-    train_y = data[0:30000, 14]
-    train_y = torch.tensor(train_y)
-    train_set = H5Dataset(train_x, train_y)
-
-    test_x = np.concatenate([data[30000:40000, 0:14], data[30000:40000, 15:]],axis=1)
-    test_x = torch.tensor(test_x)
-    test_y = data[30000:40000, 14]
-    test_y = torch.tensor(test_y)
-    test_set = H5Dataset(test_x, test_y)
-
+    train_set = load_data("data/bank/train.csv")
+    test_set = load_data("data/bank/test.csv")
     return train_set, test_set
 
+def load_kdd99():
+    train_set = load_data("data/kdd99/train_10.csv")
+    test_set = load_data("data/kdd99/test.csv")
+    return train_set, test_set
+
+def load_nslkdd():
+    train_set = load_data("data/nslkdd/train.csv")
+    test_set = load_data("data/nslkdd/test.csv")
+    return train_set, test_set
 
 class Dataloader(object):
     def __init__(self, data, batch_size=64, shuffle=True):
         self.shuffle = shuffle
         self.batch_size = batch_size
-        self.size = data.size(0)
+        self.size = data.shape[0]
         self.data = data
         self.iter = 0
 
@@ -152,4 +161,3 @@ def generate_dataset_from_json(file_name, n_items):
         example_dists.append(agent_dists)
 
     return torch.tensor(example_dists)
-
